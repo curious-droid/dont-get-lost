@@ -78,7 +78,7 @@ void IRAM_ATTR CST816S::handleISR(void) {
 void CST816S::begin(int interrupt) {
   Wire.begin(_sda, _scl);
 
-  pinMode(_irq, INPUT_PULLUP);
+  pinMode(_irq, INPUT);
   pinMode(_rst, OUTPUT);
 
   digitalWrite(_rst, HIGH );

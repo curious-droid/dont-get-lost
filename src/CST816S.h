@@ -63,7 +63,7 @@ class CST816S {
     data_struct data;
     String gesture();
 
-  void read_touch();
+
   private:
     int _sda;
     int _scl;
@@ -72,7 +72,7 @@ class CST816S {
     bool _event_available;
 
     void IRAM_ATTR handleISR();
-    // void read_touch();
+    void read_touch();
 
     uint8_t i2c_read(uint16_t addr, uint8_t reg_addr, uint8_t * reg_data, uint32_t length);
     uint8_t i2c_write(uint8_t addr, uint8_t reg_addr, const uint8_t * reg_data, uint32_t length);
