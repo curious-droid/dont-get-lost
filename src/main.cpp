@@ -1,12 +1,21 @@
 #include <Arduino.h>
 #include "LCD_Test.h"
 
-UWORD Imagesize = LCD_1IN28_HEIGHT * LCD_1IN28_WIDTH * 2;
+#include <Wire.h>
+#include <Adafruit_BNO08x.h>
+Adafruit_BNO08x bno08x;
+
+const int bno08xSDA = 15;
+const int bno08xSCL = 16;
+
+
+UDOUBLE Imagesize = LCD_1IN28_HEIGHT * LCD_1IN28_WIDTH * 2;
 UWORD *BlackImage;
 CST816S touch(6, 7, 13, 5);	// sda, scl, rst, irq
 
 void setup()
 {
+  sleep(5);
     Serial.begin(115200);
     touch.begin();
     // PSRAM Initialize
@@ -15,6 +24,9 @@ void setup()
     }else{
       Serial.println("PSRAM not available");
     }
+
+
+
     if ((BlackImage = (UWORD *)ps_malloc(Imagesize)) == NULL){
         Serial.println("Failed to apply for black memory...");
         exit(0);
@@ -41,6 +53,28 @@ void setup()
       delay(2000);
       LCD_1IN28_Clear(BLUE);
       delay(2000);
+
+
+#if 1
+
+  Serial.println("BNO08x startup sequence");
+  // TwoWire I2Cbno08x = TwoWire(1);
+  // Serial.println("I2C bus created");
+  Wire1.begin(bno08xSDA, bno08xSCL); 
+  Wire1.setClock(100000);
+  Serial.println("I2C bus started");
+
+  if (!bno08x.begin_I2C(0x4B, &Wire1)) {
+    Serial.println("BNO08x not detected");
+  }
+  else{
+    bno08x.enableReport(SH2_ROTATION_VECTOR);
+    Serial.println("BNO08x ready");
+  }
+  Serial.println("BNO08x startup done");
+
+#endif
+
 
       // /*2.Drawing on the image*/
 #if 1
@@ -96,7 +130,7 @@ void setup()
       Paint_DrawString_EN(45, 175, "GYR_Z = ", &Font16, WHITE, BLACK);
       Paint_DrawString_EN(45, 200, "BAT(V)=", &Font16, WHITE, BLACK);
       LCD_1IN28_Display(BlackImage);
-      while (true)//something in here is the problem
+      while (true)
       {
           // result = DEC_ADC_Read();
           QMI8658_read_xyz(acc, gyro, &tim_count);
@@ -133,6 +167,23 @@ void setup()
           Paint_DrawPoint(touch.data.x, touch.data.y, BLACK, DOT_PIXEL_3X3, DOT_FILL_RIGHTUP);
           LCD_1IN28_DisplayWindows(touch.data.x, touch.data.y, touch.data.x + 3, touch.data.y + 3, BlackImage);
         }
+
+#if 1
+
+  sh2_SensorValue_t sensor;
+  if (bno08x.getSensorEvent(&sensor)) {
+    float qw = sensor.un.rotationVector.real;
+    float qx = sensor.un.rotationVector.i;
+    float qy = sensor.un.rotationVector.j;
+    float qz = sensor.un.rotationVector.k;
+
+    Serial.print("Q:");
+    Serial.print(qw); Serial.print(", ");
+    Serial.print(qx); Serial.print(", ");
+    Serial.print(qy); Serial.print(", ");
+    Serial.println(qz);
+  }
+#endif
 
     }
 #endif

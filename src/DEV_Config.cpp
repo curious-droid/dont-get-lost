@@ -227,10 +227,12 @@ uint8_t DEV_Module_Init(void)
     pinMode(vspi->pinSS(), OUTPUT); //VSPI SS
     vspi->beginTransaction(SPISettings(80000000, MSBFIRST, SPI_MODE0));
     
-    // I2C Config
-    Wire.setPins(DEV_SDA_PIN, DEV_SCL_PIN);
+    // I2C Config (skip if the bus was already started, e.g. by the CST816S touch driver)
+    if (!i2cIsInit(0)) {
+        Wire.setPins(DEV_SDA_PIN, DEV_SCL_PIN);
+        Wire.begin();
+    }
     Wire.setClock(400000);
-    Wire.begin();
     printf("DEV_Module_Init OK \r\n");
     return 0;
 }
