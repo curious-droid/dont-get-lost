@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Don't Get Lost — Route Planner</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 system-ui, sans-serif; display: flex;
+         height: 100vh; color: #1a202c; }
+  #map { flex: 1; min-width: 0; }
+  #side { width: 340px; overflow-y: auto; padding: 14px 16px; border-left: 1px solid #ddd;
+          background: #fafafa; flex-shrink: 0; }
+  h1 { font-size: 17px; margin: 0 0 10px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em;
+       color: #666; margin: 18px 0 6px; }
+  button { padding: 6px 12px; border: 1px solid #bbb; border-radius: 6px;
+           background: #fff; cursor: pointer; font: inherit; }
+  button:hover { background: #f0f0f0; }
+  button.primary { background: #2563eb; color: #fff; border-color: #2563eb; }
+  button.primary:hover { background: #1d4ed8; }
+  button:disabled { opacity: .45; cursor: default; }
+  input, select { padding: 5px 8px; border: 1px solid #bbb; border-radius: 6px;
+                  font: inherit; background: #fff; }
+  .row { display: flex; gap: 6px; margin: 6px 0; align-items: center; flex-wrap: wrap; }
+  .row label { min-width: 70px; color: #444; }
+  #stats { background: #eef2ff; border-radius: 8px; padding: 8px 10px; margin: 8px 0; }
+  #log { font: 12px/1.5 ui-monospace, monospace; background: #111; color: #9fe870;
+         border-radius: 8px; padding: 8px 10px; height: 110px; overflow-y: auto;
+         white-space: pre-wrap; }
+  .slot { display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+          border: 1px solid #ddd; border-radius: 8px; margin: 4px 0; background: #fff; }
+  .slot .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .slot .empty { color: #999; font-style: italic; }
+  .mode button.on { background: #2563eb; color: #fff; border-color: #2563eb; }
+  .hint { color: #666; font-size: 12.5px; margin: 4px 0; }
+  progress { width: 100%; height: 8px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="side">
+  <h1>Don't Get Lost — Route Planner</h1>
+
+  <h2>Plan</h2>
+  <div class="row mode">
+    <button id="modeDraw" class="on">Draw</button>
+    <button id="modeLoop">Round trip</button>
+    <label style="min-width:0"><input type="file" id="gpxFile" accept=".gpx" hidden>
+      <button onclick="gpxFile.click()">GPX…</button></label>
+  </div>
+  <div id="drawUi">
+    <div class="hint">Click the map to add waypoints — the route snaps to
+      walking paths between them.</div>
+    <div class="row">
+      <button id="undoBtn">Undo point</button>
+      <button id="clearBtn">Clear</button>
+      <label><input type="checkbox" id="loopBack"> return to start</label>
+    </div>
+  </div>
+  <div id="loopUi" style="display:none">
+    <div class="hint">Click the map to set a start point, choose a length,
+      and generate a circular walking route.</div>
+    <div class="row">
+      <label>Length</label>
+      <input type="number" id="loopKm" value="3" min="0.5" max="30" step="0.5" style="width:70px"> km
+      <button id="genBtn" class="primary">Generate</button>
+      <button id="reGenBtn" title="try a different direction">↻</button>
+    </div>
+  </div>
+  <div id="stats">No route yet.</div>
+
+  <h2>Device</h2>
+  <div class="row">
+    <button id="btBtn" class="primary">Connect watch</button>
+    <span id="btState" class="hint">not connected</span>
+  </div>
+  <div class="row">
+    <label>Name</label>
+    <input id="routeName" maxlength="16" placeholder="morning loop" style="flex:1">
+  </div>
+  <div id="slots"></div>
+  <progress id="prog" value="0" max="1" style="display:none"></progress>
+
+  <h2>Log</h2>
+  <div id="log"></div>
+  <div class="hint" style="margin-top:8px">
+    Serve over <b>https or localhost</b> (Web Bluetooth requirement).
+    Works in Chrome/Edge on desktop and the Bluefy browser on iPhone.
+    Routing by OSRM/FOSSGIS on OpenStreetMap data.
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+'use strict';
+/* ============================== map ============================== */
+const map = L.map('map').setView([37.7749, -122.4194], 14);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+  { attribution: '&copy; OpenStreetMap contributors', maxZoom: 19 }).addTo(map);
+if (navigator.geolocation)
+  navigator.geolocation.getCurrentPosition(
+    p => map.setView([p.coords.latitude, p.coords.longitude], 15), () => {});
+
+const OSRM = 'https://routing.openstreetmap.de/routed-foot/route/v1/foot/';
+
+let mode = 'draw';            // 'draw' | 'loop'
+let waypoints = [];           // L.LatLng, draw mode
+let loopStart = null;         // L.LatLng, loop mode
+let loopBearing = Math.random() * 360;
+let routeLatLngs = [];        // full-resolution route geometry
+let devicePts = [];           // simplified points for upload
+let markers = [], routeLine = null, cpLayer = null;
+
+const $ = id => document.getElementById(id);
+const log = m => { $('log').textContent += m + '\n'; $('log').scrollTop = 1e9; };
+
+/* ---------- geometry helpers (meters, equirectangular locally) ---------- */
+const R = 6371000, rad = d => d * Math.PI / 180, deg = r => r * 180 / Math.PI;
+function distM(a, b) {
+  const x = rad(b.lng - a.lng) * Math.cos(rad((a.lat + b.lat) / 2));
+  const y = rad(b.lat - a.lat);
+  return Math.sqrt(x * x + y * y) * R;
+}
+function destPoint(p, bearingDeg, dM) {   // great-circle destination
+  const br = rad(bearingDeg), dr = dM / R, la1 = rad(p.lat), lo1 = rad(p.lng);
+  const la2 = Math.asin(Math.sin(la1) * Math.cos(dr) +
+                        Math.cos(la1) * Math.sin(dr) * Math.cos(br));
+  const lo2 = lo1 + Math.atan2(Math.sin(br) * Math.sin(dr) * Math.cos(la1),
+                               Math.cos(dr) - Math.sin(la1) * Math.sin(la2));
+  return L.latLng(deg(la2), deg(lo2));
+}
+function pathLen(pts) {
+  let s = 0;
+  for (let i = 1; i < pts.length; i++) s += distM(pts[i - 1], pts[i]);
+  return s;
+}
+
+/* Douglas-Peucker with a meter tolerance */
+function simplifyDP(pts, tolM) {
+  if (pts.length < 3) return pts.slice();
+  const keep = new Uint8Array(pts.length); keep[0] = keep[pts.length - 1] = 1;
+  const stack = [[0, pts.length - 1]];
+  while (stack.length) {
+    const [a, b] = stack.pop();
+    const A = pts[a], B = pts[b];
+    const cosLat = Math.cos(rad((A.lat + B.lat) / 2));
+    const ax = rad(A.lng) * cosLat * R, ay = rad(A.lat) * R;
+    const bx = rad(B.lng) * cosLat * R, by = rad(B.lat) * R;
+    const dx = bx - ax, dy = by - ay, len2 = dx * dx + dy * dy;
+    let worst = -1, worstD = tolM;
+    for (let i = a + 1; i < b; i++) {
+      const px = rad(pts[i].lng) * cosLat * R, py = rad(pts[i].lat) * R;
+      let d;
+      if (len2 === 0) d = Math.hypot(px - ax, py - ay);
+      else {
+        const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / len2));
+        d = Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+      }
+      if (d > worstD) { worstD = d; worst = i; }
+    }
+    if (worst >= 0) { keep[worst] = 1; stack.push([a, worst], [worst, b]); }
+  }
+  return pts.filter((_, i) => keep[i]);
+}
+
+/* Simplify then bound checkpoint spacing so the follower's 25 m capture
+ * radius can't slip between checkpoints on long straights. */
+function toDevicePoints(pts) {
+  let tol = 8;
+  let out = simplifyDP(pts, tol);
+  const withSpacing = arr => {
+    const o = [arr[0]];
+    for (let i = 1; i < arr.length; i++) {
+      const d = distM(arr[i - 1], arr[i]), n = Math.floor(d / 50);
+      for (let k = 1; k <= n; k++)
+        o.push(L.latLng(
+          arr[i - 1].lat + (arr[i].lat - arr[i - 1].lat) * k / (n + 1),
+          arr[i - 1].lng + (arr[i].lng - arr[i - 1].lng) * k / (n + 1)));
+      o.push(arr[i]);
+    }
+    return o;
+  };
+  out = withSpacing(out);
+  while (out.length > 600 && tol < 100) {   // device cap
+    tol *= 1.6;
+    out = withSpacing(simplifyDP(pts, tol));
+  }
+  return out.slice(0, 600);
+}
+
+/* ---------------------------- routing ---------------------------- */
+async function osrmRoute(wps) {
+  const coords = wps.map(p => `${p.lng.toFixed(6)},${p.lat.toFixed(6)}`).join(';');
+  const res = await fetch(`${OSRM}${coords}?overview=full&geometries=geojson&steps=false`);
+  if (!res.ok) throw new Error('routing server error ' + res.status);
+  const j = await res.json();
+  if (j.code !== 'Ok' || !j.routes.length) throw new Error('no route found');
+  return {
+    latlngs: j.routes[0].geometry.coordinates.map(c => L.latLng(c[1], c[0])),
+    distM: j.routes[0].distance,
+  };
+}
+
+function setRoute(latlngs) {
+  routeLatLngs = latlngs;
+  devicePts = latlngs.length ? toDevicePoints(latlngs) : [];
+  if (routeLine) routeLine.remove();
+  if (cpLayer) cpLayer.remove();
+  routeLine = cpLayer = null;
+  if (latlngs.length) {
+    routeLine = L.polyline(latlngs, { color: '#2563eb', weight: 4 }).addTo(map);
+    cpLayer = L.layerGroup(devicePts.map(p =>
+      L.circleMarker(p, { radius: 2.5, color: '#dc2626', fillOpacity: 1 }))).addTo(map);
+  }
+  const len = pathLen(latlngs);
+  $('stats').innerHTML = latlngs.length
+    ? `<b>${(len / 1000).toFixed(2)} km</b> &middot; ${devicePts.length} checkpoints
+       &middot; ~${Math.round(len / 5000 * 60)} min walk`
+    : 'No route yet.';
+  updateSlotButtons();
+}
+
+async function rebuildDrawRoute() {
+  if (waypoints.length < 2) { setRoute([]); return; }
+  const wps = waypoints.slice();
+  if ($('loopBack').checked && waypoints.length >= 2) wps.push(waypoints[0]);
+  try { setRoute((await osrmRoute(wps)).latlngs); }
+  catch (e) { log('routing failed: ' + e.message); }
+}
+
+/* Round trip: waypoints on a circle through the start, sized so the
+ * routed length lands near the target; one corrective iteration. */
+async function generateLoop() {
+  if (!loopStart) { log('click the map to set a start point first'); return; }
+  const targetM = parseFloat($('loopKm').value) * 1000;
+  let r = targetM / (2 * Math.PI) * 1.1;
+  let best = null;
+  try {
+    for (let iter = 0; iter < 3; iter++) {
+      const center = destPoint(loopStart, loopBearing, r);
+      const backBearing = (loopBearing + 180) % 360;
+      const wps = [loopStart];
+      for (let i = 1; i < 4; i++)
+        wps.push(destPoint(center, backBearing + i * 90, r));
+      wps.push(loopStart);
+      const rt = await osrmRoute(wps);
+      best = rt;
+      const ratio = targetM / rt.distM;
+      if (ratio > 0.85 && ratio < 1.15) break;
+      r *= Math.max(0.4, Math.min(2.5, ratio));
+    }
+    setRoute(best.latlngs);
+    log(`loop: ${(pathLen(best.latlngs) / 1000).toFixed(2)} km (target ${(targetM / 1000).toFixed(1)})`);
+  } catch (e) { log('loop generation failed: ' + e.message); }
+}
+
+/* ------------------------------ modes ------------------------------ */
+function setMode(m) {
+  mode = m;
+  $('modeDraw').classList.toggle('on', m === 'draw');
+  $('modeLoop').classList.toggle('on', m === 'loop');
+  $('drawUi').style.display = m === 'draw' ? '' : 'none';
+  $('loopUi').style.display = m === 'loop' ? '' : 'none';
+}
+$('modeDraw').onclick = () => setMode('draw');
+$('modeLoop').onclick = () => setMode('loop');
+
+map.on('click', e => {
+  if (mode === 'draw') {
+    waypoints.push(e.latlng);
+    markers.push(L.marker(e.latlng).addTo(map));
+    rebuildDrawRoute();
+  } else {
+    loopStart = e.latlng;
+    markers.forEach(m => m.remove()); markers = [];
+    markers.push(L.marker(e.latlng).addTo(map));
+  }
+});
+$('undoBtn').onclick = () => {
+  waypoints.pop();
+  const m = markers.pop(); if (m) m.remove();
+  rebuildDrawRoute();
+};
+$('clearBtn').onclick = () => {
+  waypoints = []; markers.forEach(m => m.remove()); markers = [];
+  setRoute([]);
+};
+$('loopBack').onchange = rebuildDrawRoute;
+$('genBtn').onclick = generateLoop;
+$('reGenBtn').onclick = () => { loopBearing = Math.random() * 360; generateLoop(); };
+
+$('gpxFile').onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  const doc = new DOMParser().parseFromString(await f.text(), 'application/xml');
+  let nodes = [...doc.getElementsByTagName('trkpt')];
+  if (!nodes.length) nodes = [...doc.getElementsByTagName('rtept')];
+  const pts = nodes.map(n =>
+    L.latLng(parseFloat(n.getAttribute('lat')), parseFloat(n.getAttribute('lon'))));
+  if (pts.length < 2) { log('no track points in GPX'); return; }
+  setRoute(pts);
+  map.fitBounds(L.latLngBounds(pts));
+  log(`GPX: ${pts.length} points, ${(pathLen(pts) / 1000).toFixed(2)} km`);
+  e.target.value = '';
+};
+
+/* ============================ bluetooth ============================ */
+const SVC  = 'f3641400-00b0-4240-ba50-05ca45bf8abc';
+const CTRL = 'f3641401-00b0-4240-ba50-05ca45bf8abc';
+const DATA = 'f3641402-00b0-4240-ba50-05ca45bf8abc';
+const INFO = 'f3641403-00b0-4240-ba50-05ca45bf8abc';
+
+let ctrlChr = null, dataChr = null, infoChr = null;
+let ackWaiter = null;   // {opcode, resolve, reject, timer}
+
+function onNotify(e) {
+  const v = new Uint8Array(e.target.value.buffer);
+  if (ackWaiter && v[0] === ackWaiter.opcode) {
+    clearTimeout(ackWaiter.timer);
+    const w = ackWaiter; ackWaiter = null;
+    v[1] === 0 ? w.resolve() : w.reject(new Error(`device error ${v[1]} (op ${v[0]})`));
+  }
+}
+function waitAck(opcode, ms = 8000) {
+  return new Promise((resolve, reject) => {
+    ackWaiter = { opcode, resolve, reject,
+      timer: setTimeout(() => { ackWaiter = null; reject(new Error('ack timeout')); }, ms) };
+  });
+}
+
+async function connect() {
+  if (!navigator.bluetooth) { log('No Web Bluetooth in this browser'); return; }
+  try {
+    const dev = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'DontGetLost' }, { services: [SVC] }],
+      optionalServices: [SVC],
+    });
+    dev.addEventListener('gattserverdisconnected', () => {
+      ctrlChr = dataChr = infoChr = null;
+      $('btState').textContent = 'disconnected';
+      updateSlotButtons();
+    });
+    const gatt = await dev.gatt.connect();
+    const svc = await gatt.getPrimaryService(SVC);
+    ctrlChr = await svc.getCharacteristic(CTRL);
+    dataChr = await svc.getCharacteristic(DATA);
+    infoChr = await svc.getCharacteristic(INFO);
+    await ctrlChr.startNotifications();
+    ctrlChr.addEventListener('characteristicvaluechanged', onNotify);
+    $('btState').textContent = 'connected';
+    log('connected to ' + dev.name);
+    await refreshSlots();
+  } catch (e) { log('connect failed: ' + e.message); }
+}
+$('btBtn').onclick = connect;
+
+async function refreshSlots() {
+  if (!infoChr) { renderSlots([]); return; }
+  try {
+    const v = await infoChr.readValue();
+    renderSlots(JSON.parse(new TextDecoder().decode(v)));
+  } catch (e) { log('list failed: ' + e.message); renderSlots([]); }
+}
+
+function renderSlots(list) {
+  const el = $('slots');
+  el.innerHTML = '';
+  if (!ctrlChr) { el.innerHTML = '<div class="hint">connect to see the watch’s route slots</div>'; return; }
+  for (let s = 0; s < 4; s++) {
+    const m = list.find(x => x.slot === s) || { points: 0 };
+    const row = document.createElement('div');
+    row.className = 'slot';
+    row.innerHTML = m.points
+      ? `<span class="name"><b>${s}</b> ${m.name || '(no name)'} — ${(m.m / 1000).toFixed(1)} km</span>`
+      : `<span class="name empty"><b>${s}</b> empty</span>`;
+    const up = document.createElement('button');
+    up.textContent = 'Upload here';
+    up.className = 'primary';
+    up.disabled = !devicePts.length;
+    up.onclick = () => upload(s);
+    row.appendChild(up);
+    if (m.points) {
+      const del = document.createElement('button');
+      del.textContent = '✕';
+      del.title = 'delete';
+      del.onclick = async () => {
+        try {
+          const ack = waitAck(3);
+          await ctrlChr.writeValueWithResponse(new Uint8Array([3, s]));
+          await ack;
+          log(`slot ${s} deleted`);
+          await refreshSlots();
+        } catch (e) { log('delete failed: ' + e.message); }
+      };
+      row.appendChild(del);
+    }
+    el.appendChild(row);
+  }
+}
+function updateSlotButtons() { if (ctrlChr) refreshSlots(); else renderSlots([]); }
+
+async function upload(slot) {
+  if (!ctrlChr || !devicePts.length) return;
+  const name = ($('routeName').value || 'route').slice(0, 16);
+  const nameBytes = new TextEncoder().encode(name).slice(0, 16);
+  const count = devicePts.length;
+
+  const body = new ArrayBuffer(count * 8);
+  const dv = new DataView(body);
+  devicePts.forEach((p, i) => {
+    dv.setInt32(i * 8, Math.round(p.lat * 1e7), true);
+    dv.setInt32(i * 8 + 4, Math.round(p.lng * 1e7), true);
+  });
+
+  const prog = $('prog');
+  prog.style.display = ''; prog.value = 0;
+  try {
+    const begin = new Uint8Array(5 + nameBytes.length);
+    begin.set([1, slot, count & 255, count >> 8, nameBytes.length]);
+    begin.set(nameBytes, 5);
+    let ack = waitAck(1);
+    await ctrlChr.writeValueWithResponse(begin);
+    await ack;
+
+    const CHUNK = 240;   // 30 points, fits any negotiated MTU
+    for (let off = 0; off < body.byteLength; off += CHUNK) {
+      await dataChr.writeValueWithResponse(
+        new Uint8Array(body, off, Math.min(CHUNK, body.byteLength - off)));
+      prog.value = off / body.byteLength;
+    }
+
+    ack = waitAck(2);
+    await ctrlChr.writeValueWithResponse(new Uint8Array([2]));
+    await ack;
+    prog.value = 1;
+    log(`uploaded "${name}" to slot ${slot} (${count} pts)`);
+    await refreshSlots();
+  } catch (e) { log('upload failed: ' + e.message); }
+  finally { setTimeout(() => prog.style.display = 'none', 800); }
+}
+
+renderSlots([]);
+</script>
+</body>
+</html>

@@ -25,6 +25,9 @@
 #include <TinyGPSPlus.h>
 #include <math.h>
 #include "wmm.h"
+#include "route_store.h"
+#include "route_ble.h"
+#include "route_nav.h"
 
 /* ------------------------------------------------------------------ */
 /*  Configuration                                                      */
@@ -51,8 +54,16 @@ static const float MAG_DECLINATION_DEFAULT = 12.8f;
 static const float DECL_RECOMPUTE_M       = 10000.0f;
 
 static const float STRIDE_M           = 0.72f;  // avg step length, meters
-static const uint32_t FRAME_MS        = 50;     // ~20 fps
+static const uint32_t FRAME_MS        = 50;     // ~20 fps while moving
 static const float SMOOTH_ALPHA       = 0.30f;  // heading low-pass strength
+
+/* Power saving */
+static const uint32_t CPU_MHZ         = 80;     // min for BLE; APB (SPI/UART) unaffected
+static const uint32_t FRAME_IDLE_MS   = 500;    // refresh rate when nothing moves
+static const float    ACTIVE_HDG_DEG  = 0.8f;   // heading delta that counts as motion
+static const uint8_t  BL_ACTIVE       = 90;     // backlight, recent interaction
+static const uint8_t  BL_DIM          = 12;     // backlight, idle
+static const uint32_t BL_DIM_AFTER_MS = 20000;
 
 /* ------------------------------------------------------------------ */
 /*  Colors (RGB565)                                                    */
@@ -102,6 +113,10 @@ static bool      haveStepBase   = false;
 static uint32_t  lastFrameMs    = 0;
 static uint32_t  lastTapMs      = 0;
 static uint32_t  lockFlashUntil = 0;      // "TARGET SET" flash timer
+static uint32_t  lastInteractMs = 0;      // backlight / frame-rate boost
+static float     lastDrawnHdg   = -999.0f;
+static bool      menuDirty      = false;  // menu screen redraws on demand
+static bool      gpsCfgDone     = false;
 
 static bool      gpsFix         = false;  // valid & recent position
 static uint32_t  gpsLastDataMs  = 0;      // last time NMEA bytes arrived
@@ -115,6 +130,19 @@ static float     magDeclinationDeg = MAG_DECLINATION_DEFAULT;
 static double    declLat        = 0.0;    // where declination was computed
 static double    declLng        = 0.0;
 static bool      declFromGps    = false;
+
+static double    gpsCurLat      = 0.0;    // most recent valid fix
+static double    gpsCurLng      = 0.0;
+
+/* Route mode / menu */
+enum UiScreen { SCR_MAIN, SCR_MENU };
+static UiScreen  uiScreen       = SCR_MAIN;
+static bool      routeMode      = false;  // arrow follows route checkpoints
+static int       activeSlot     = -1;
+static RouteMeta menuMeta[ROUTE_SLOTS];
+static RoutePoint *routeBuf     = NULL;
+static char      toastMsg[24]   = "";
+static uint32_t  toastUntil     = 0;
 
 /* Screen geometry */
 static const int CX = 120, CY = 120;
@@ -201,8 +229,9 @@ static const char *cardinalName(float deg) {
 /*  BNO08x                                                             */
 /* ------------------------------------------------------------------ */
 static void imuEnableReports() {
-  // Fused orientation (gyro + accel + magnetometer), 50 Hz
-  if (!bno08x.enableReport(SH2_ROTATION_VECTOR, 20000))
+  // Fused orientation (gyro + accel + magnetometer), 20 Hz — plenty for a
+  // walking compass, and cheaper than 50 Hz for the sensor, I2C, and CPU
+  if (!bno08x.enableReport(SH2_ROTATION_VECTOR, 50000))
     Serial.println("Failed to enable rotation vector");
   // Step counter for distance estimate until GPS exists, 2 Hz
   if (!bno08x.enableReport(SH2_STEP_COUNTER, 500000))
@@ -261,6 +290,31 @@ static void imuService() {
 /* ------------------------------------------------------------------ */
 /*  GPS (BN-880)                                                       */
 /* ------------------------------------------------------------------ */
+/* Send a UBX frame (u-blox binary protocol) with checksum. */
+static void ubxSend(uint8_t cls, uint8_t id, const uint8_t *payload, uint16_t len) {
+  uint8_t ckA = 0, ckB = 0;
+  auto put = [&](uint8_t b) { Serial1.write(b); ckA += b; ckB += ckA; };
+  Serial1.write(0xB5);
+  Serial1.write(0x62);
+  put(cls); put(id); put(len & 0xFF); put(len >> 8);
+  for (uint16_t i = 0; i < len; i++) put(payload[i]);
+  Serial1.write(ckA);
+  Serial1.write(ckB);
+}
+
+/* Cut GPS power draw: drop the NMEA sentences we never parse (GSV is the
+ * bulk of the traffic) and put the u-blox M8 into its "aggressive 1 Hz"
+ * power-save mode (duty-cycled tracking, roughly halves receiver current). */
+static void gpsConfigurePower() {
+  Serial1.print("$PUBX,40,GLL,0,0,0,0,0,0*5C\r\n");
+  Serial1.print("$PUBX,40,GSA,0,0,0,0,0,0*4E\r\n");
+  Serial1.print("$PUBX,40,GSV,0,0,0,0,0,0*59\r\n");
+  Serial1.print("$PUBX,40,VTG,0,0,0,0,0,0*5E\r\n");
+  const uint8_t pms[8] = {0, 3, 0, 0, 0, 0, 0, 0};  // UBX-CFG-PMS: aggressive 1 Hz
+  ubxSend(0x06, 0x86, pms, 8);
+  Serial.println("GPS power-save configured");
+}
+
 /* Decimal year from the GPS date, e.g. 2026.63 (leap-day error is
  * negligible for declination). */
 static float gpsDecimalYear() {
@@ -288,6 +342,11 @@ static void updateDeclination(double lat, double lng) {
 
 /* Feed NMEA to the parser, keep fix state and walk distance current. */
 static void gpsService() {
+  // one-shot config, delayed so the module is done booting
+  if (!gpsCfgDone && millis() > 3000) {
+    gpsConfigurePower();
+    gpsCfgDone = true;
+  }
   while (Serial1.available()) {
     gps.encode(Serial1.read());
     gpsLastDataMs = millis();
@@ -298,7 +357,10 @@ static void gpsService() {
   if (gps.location.isUpdated() && gps.location.isValid()) {
     double lat = gps.location.lat();
     double lng = gps.location.lng();
+    gpsCurLat = lat;
+    gpsCurLng = lng;
     updateDeclination(lat, lng);
+    if (routeMode) navUpdate(lat, lng);
     if (state == ST_TRACKING && gpsHaveAnchor) {
       float d = (float)TinyGPSPlus::distanceBetween(gpsLastLat, gpsLastLng, lat, lng);
       if (d >= GPS_MIN_STEP_M) {
@@ -314,6 +376,90 @@ static void gpsService() {
       gpsLastLng = lng;
       gpsHaveAnchor = true;
     }
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Routes: BLE service pump + selection                               */
+/* ------------------------------------------------------------------ */
+static void showToast(const char *msg) {
+  strncpy(toastMsg, msg, sizeof(toastMsg) - 1);
+  toastMsg[sizeof(toastMsg) - 1] = 0;
+  toastUntil = millis() + 2000;
+}
+
+/* Backlight: full while interacting or showing a toast, dim when idle. */
+static void setBacklight(uint8_t v) {
+  static uint8_t cur = 255;
+  if (v != cur) {
+    DEV_SET_PWM(v);
+    cur = v;
+  }
+}
+
+static void backlightService() {
+  uint32_t now = millis();
+  bool bright = (now - lastInteractMs < BL_DIM_AFTER_MS) || now < toastUntil;
+  setBacklight(bright ? BL_ACTIVE : BL_DIM);
+}
+
+/* Rebuild the JSON served by the BLE INFO characteristic. */
+static void refreshBleInfo() {
+  static char js[320];
+  int off = 0;
+  off += sprintf(js + off, "[");
+  for (uint8_t s = 0; s < ROUTE_SLOTS; s++) {
+    RouteMeta m;
+    routeLoadMeta(s, m);
+    off += sprintf(js + off, "%s{\"slot\":%u,\"name\":\"%s\",\"points\":%u,\"m\":%d}",
+                   s ? "," : "", s, m.count ? m.name : "", m.count, (int)m.lengthM);
+  }
+  sprintf(js + off, "]");
+  routeBleSetInfo(js);
+}
+
+static bool selectRoute(uint8_t slot) {
+  RouteMeta m;
+  if (!routeBuf || !routeLoadPoints(slot, routeBuf, ROUTE_MAX_POINTS, m)) return false;
+  navSetRoute(m, routeBuf);
+  routeMode = true;
+  activeSlot = slot;
+  showToast(m.name[0] ? m.name : "ROUTE LOADED");
+  Serial.printf("Route '%s' active: %u pts, %.0f m\n", m.name, m.count, m.lengthM);
+  return true;
+}
+
+static void openMenu();   // defined with the UI below
+
+/* Handle storage work queued by the BLE task, then ack the client. */
+static void bleService() {
+  RouteBleOp op = routeBleTakeOp();
+  if (op == RBLE_NONE) return;
+
+  uint8_t slot = routeBleOpSlot();
+  if (op == RBLE_SAVE) {
+    char name[ROUTE_NAME_LEN + 1];
+    strncpy(name, routeBleOpName(), sizeof(name) - 1);
+    name[sizeof(name) - 1] = 0;
+    for (char *p = name; *p; p++)          // keep the INFO JSON valid
+      if (*p == '"' || *p == '\\') *p = '_';
+    bool ok = routeSave(slot, name, routeBleOpPoints(), routeBleOpCount());
+    refreshBleInfo();
+    routeBleAck(0x02, ok ? 0 : 1);
+    showToast(ok ? "ROUTE RECEIVED" : "SAVE FAILED");
+    if (ok && activeSlot == (int)slot) selectRoute(slot);  // live reload
+    if (uiScreen == SCR_MENU) openMenu();                  // refresh the list
+  } else if (op == RBLE_DELETE) {
+    bool ok = routeDelete(slot);
+    refreshBleInfo();
+    routeBleAck(0x03, ok ? 0 : 1);
+    if (ok && activeSlot == (int)slot) {
+      navClear();
+      routeMode = false;
+      activeSlot = -1;
+      showToast("ROUTE DELETED");
+    }
+    if (uiScreen == SCR_MENU) openMenu();                  // refresh the list
   }
 }
 
@@ -369,6 +515,17 @@ static void drawArrow() {
   if (!imuOk || !haveHeading) {
     rel = 0.0f;
     fill = COL_DIM;
+  } else if (routeMode) {
+    if (navDone()) {
+      rel = 0.0f;
+      fill = COL_GOOD;
+    } else if (!gpsFix) {
+      rel = 0.0f;
+      fill = COL_DIM;
+    } else {
+      rel = wrap360(navBearingDeg(gpsCurLat, gpsCurLng) - headingDisp);
+      fill = navOffRoute() ? COL_WARN : COL_GOOD;
+    }
   } else if (!targetSet) {
     // No target yet: act as a plain compass needle pointing north
     rel = wrap360(-headingDisp);
@@ -430,8 +587,23 @@ static void drawReadouts() {
   sprintf(buf, "%d", (int)gps.satellites.value());
   Paint_DrawString_EN(CX + 52, 30, buf, &Font8, COL_DIM, COL_BG);
 
-  // Target line under the arrow
-  if (millis() < lockFlashUntil) {
+  // Status line under the arrow
+  if (millis() < toastUntil) {
+    drawStringCentered(CX, 152, toastMsg, &Font12, COL_TARGET, COL_BG);
+  } else if (routeMode) {
+    if (navDone()) {
+      drawStringCentered(CX, 152, "ROUTE DONE", &Font12, COL_GOOD, COL_BG);
+    } else if (!gpsFix) {
+      drawStringCentered(CX, 152, "ROUTE: NO GPS", &Font12, COL_WARN, COL_BG);
+    } else {
+      char db[12];
+      formatDistance(navDistToTargetM(gpsCurLat, gpsCurLng), db);
+      sprintf(buf, "%s CP %u/%u %s", navOffRoute() ? "OFF!" : "",
+              navTargetIdx() + 1, navCount(), db);
+      drawStringCentered(CX, 152, buf, &Font12,
+                         navOffRoute() ? COL_WARN : COL_TARGET, COL_BG);
+    }
+  } else if (millis() < lockFlashUntil) {
     drawStringCentered(CX, 152, "TARGET SET", &Font12, COL_TARGET, COL_BG);
   } else if (targetSet) {
     sprintf(buf, "TGT %03d %s", (int)targetBearing, cardinalName(targetBearing));
@@ -446,10 +618,20 @@ static void drawReadouts() {
   formatTime(elapsed, buf);
   drawStringCentered(72, 175, buf, &Font16, COL_TEXT, COL_BG);
 
-  // GPS distance when the walk has GPS coverage, step estimate otherwise
-  drawStringCentered(168, 166, gpsDistUsed ? "DIST GPS" : "DIST EST", &Font8, COL_DIM, COL_BG);
-  formatDistance(gpsDistUsed ? gpsDistanceM : trackedSteps * STRIDE_M, buf);
+  // Route mode: distance left on the route. Otherwise distance walked:
+  // GPS when the walk has coverage, step estimate if not.
+  if (routeMode && gpsFix && !navDone()) {
+    drawStringCentered(168, 166, "LEFT", &Font8, COL_DIM, COL_BG);
+    formatDistance(navRemainingM(gpsCurLat, gpsCurLng), buf);
+  } else {
+    drawStringCentered(168, 166, gpsDistUsed ? "DIST GPS" : "DIST EST", &Font8, COL_DIM, COL_BG);
+    formatDistance(gpsDistUsed ? gpsDistanceM : trackedSteps * STRIDE_M, buf);
+  }
   drawStringCentered(168, 175, buf, &Font16, COL_TEXT, COL_BG);
+
+  // BLE link dot, bottom of the dial
+  if (routeBleConnected())
+    Paint_DrawCircle(CX, 228, 3, BLUE, DOT_PIXEL_1X1, DRAW_FILL_FULL);
 
   // START / STOP button
   bool tracking = (state == ST_TRACKING);
@@ -459,11 +641,72 @@ static void drawReadouts() {
                      tracking ? COL_BTN_STOP : COL_BTN_GO);
 }
 
-static void drawFrame() {
+/* Route menu: 4 slot rows + compass-only row. Opened by long press. */
+static const int MENU_ROW_Y0 = 44, MENU_ROW_H = 34;
+static const int MENU_COMPASS_Y0 = 184, MENU_COMPASS_Y1 = 214;
+
+static void openMenu() {
+  for (uint8_t s = 0; s < ROUTE_SLOTS; s++) routeLoadMeta(s, menuMeta[s]);
+  uiScreen = SCR_MENU;
+  menuDirty = true;
+}
+
+static void drawMenu() {
+  char buf[28];
   Paint_Clear(COL_BG);
-  drawCompassRing();
-  drawArrow();
-  drawReadouts();
+  drawStringCentered(CX, 16, "ROUTES", &Font16, COL_TEXT, COL_BG);
+
+  for (int s = 0; s < ROUTE_SLOTS; s++) {
+    int y = MENU_ROW_Y0 + s * MENU_ROW_H;
+    UWORD frame = (s == activeSlot && routeMode) ? COL_TARGET : COL_TICK;
+    Paint_DrawRectangle(28, y, 212, y + MENU_ROW_H - 6, frame,
+                        DOT_PIXEL_1X1, DRAW_FILL_EMPTY);
+    if (menuMeta[s].count) {
+      sprintf(buf, "%.14s", menuMeta[s].name[0] ? menuMeta[s].name : "(no name)");
+      Paint_DrawString_EN(36, y + 4, buf, &Font12, COL_TEXT, COL_BG);
+      if (menuMeta[s].lengthM >= 1000)
+        sprintf(buf, "%.1fkm", menuMeta[s].lengthM / 1000.0f);
+      else
+        sprintf(buf, "%dm", (int)menuMeta[s].lengthM);
+      Paint_DrawString_EN(148, y + 16, buf, &Font12, COL_DIM, COL_BG);
+    } else {
+      Paint_DrawString_EN(36, y + 8, "- empty -", &Font12, COL_DIM, COL_BG);
+    }
+  }
+
+  UWORD cc = routeMode ? COL_TICK : COL_TARGET;
+  Paint_DrawRectangle(60, MENU_COMPASS_Y0, 180, MENU_COMPASS_Y1, cc,
+                      DOT_PIXEL_1X1, DRAW_FILL_EMPTY);
+  drawStringCentered(CX, MENU_COMPASS_Y0 + 10, "COMPASS", &Font12,
+                     routeMode ? COL_TEXT : COL_TARGET, COL_BG);
+}
+
+static void menuTap(int x, int y) {
+  if (y >= MENU_COMPASS_Y0 - 6 && y <= MENU_COMPASS_Y1 + 6) {
+    navClear();
+    routeMode = false;
+    activeSlot = -1;
+    uiScreen = SCR_MAIN;
+    showToast("COMPASS MODE");
+    return;
+  }
+  if (x < 20 || x > 220) return;
+  int s = (y - MENU_ROW_Y0) / MENU_ROW_H;
+  if (s < 0 || s >= ROUTE_SLOTS || y < MENU_ROW_Y0) return;
+  if (!menuMeta[s].count) { showToast("EMPTY SLOT"); return; }
+  if (selectRoute(s)) uiScreen = SCR_MAIN;
+  else showToast("LOAD FAILED");
+}
+
+static void drawFrame() {
+  if (uiScreen == SCR_MENU) {
+    drawMenu();
+  } else {
+    Paint_Clear(COL_BG);
+    drawCompassRing();
+    drawArrow();
+    drawReadouts();
+  }
   LCD_1IN28_Display(BlackImage);
 }
 
@@ -473,9 +716,25 @@ static void drawFrame() {
 static void handleTouch() {
   if (!touch.available()) return;
   uint32_t now = millis();
+  lastInteractMs = now;                // wake backlight / boost frame rate
   if (now - lastTapMs < 350) return;   // debounce
   int x = touch.data.x;
   int y = touch.data.y;
+
+  // Long press anywhere toggles the route menu
+  if (touch.data.gestureID == LONG_PRESS) {
+    lastTapMs = now + 400;             // swallow the release events
+    if (uiScreen == SCR_MAIN) openMenu();
+    else uiScreen = SCR_MAIN;
+    return;
+  }
+
+  if (uiScreen == SCR_MENU) {
+    lastTapMs = now;
+    menuTap(x, y);
+    menuDirty = true;
+    return;
+  }
 
   // START / STOP pill (with a little slop around it)
   if (x >= BTN_X0 - 10 && x <= BTN_X1 + 10 && y >= BTN_Y0 - 10 && y <= 239) {
@@ -497,7 +756,12 @@ static void handleTouch() {
   }
 
   // Center of the dial: lock current heading as the target bearing
+  // (compass mode only; in route mode the route drives the arrow)
   int dx = x - CX, dy = y - CY;
+  if (routeMode) {
+    if (dx * dx + dy * dy < 60 * 60) showToast("HOLD FOR MENU");
+    return;
+  }
   if (dx * dx + dy * dy < 60 * 60 && imuOk && haveHeading) {
     lastTapMs = now;
     targetBearing = headingDisp;
@@ -511,6 +775,7 @@ static void handleTouch() {
 /*  Arduino entry points                                               */
 /* ------------------------------------------------------------------ */
 void setup() {
+  setCpuFrequencyMhz(CPU_MHZ);   // 80 MHz: ~half the core power of 240 MHz
   Serial.begin(115200);
   Serial1.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
   delay(300);
@@ -542,16 +807,41 @@ void setup() {
   LCD_1IN28_Display(BlackImage);
 
   imuInit();
+
+  routeBuf = (RoutePoint *)ps_malloc(ROUTE_MAX_POINTS * sizeof(RoutePoint));
+  routeStoreInit();
+  routeBleInit();
+  refreshBleInfo();
 }
 
 void loop() {
   imuService();
   gpsService();
+  bleService();
   handleTouch();
+  backlightService();
 
   uint32_t now = millis();
-  if (now - lastFrameMs >= FRAME_MS) {
-    lastFrameMs = now;
-    drawFrame();
+  if (uiScreen == SCR_MENU) {
+    // menu is static: redraw only when its content changed
+    if (menuDirty && now - lastFrameMs >= FRAME_MS) {
+      menuDirty = false;
+      lastFrameMs = now;
+      drawFrame();
+    }
+  } else {
+    // full rate while something moves on screen, 2 Hz when the watch is
+    // still — each frame is a 115 KB SPI transfer, so idle frames are the
+    // single biggest CPU/bus cost
+    bool uiActive = (state == ST_TRACKING) || now < toastUntil ||
+                    (now - lastInteractMs < 3000) ||
+                    fabsf(wrap180(headingDisp - lastDrawnHdg)) > ACTIVE_HDG_DEG;
+    if (now - lastFrameMs >= (uiActive ? FRAME_MS : FRAME_IDLE_MS)) {
+      lastFrameMs = now;
+      lastDrawnHdg = headingDisp;
+      drawFrame();
+    }
   }
+
+  delay(2);   // let the idle task run (also required for the task watchdog)
 }
