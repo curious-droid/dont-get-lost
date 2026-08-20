@@ -122,6 +122,9 @@ void routeBleInit() {
   NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
   adv->addServiceUUID(SVC_UUID);
   adv->setName("DontGetLost");
+  // the 128-bit service UUID fills the 31-byte advertisement, so the name
+  // must ride in the scan response or scanners never see it
+  adv->enableScanResponse(true);
   // relaxed advertising interval (200-400 ms) — a fraction of the radio
   // power of the default fast advertising, still discovered in ~1 s
   adv->setMinInterval(320);   // units of 0.625 ms
