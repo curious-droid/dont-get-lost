@@ -727,7 +727,8 @@ static void drawFrame() {
  * state machine. Chip swipe gestures (which are reliable) also open it. */
 static const uint32_t HOLD_MS = 500;
 static bool     pressActive = false;
-static bool     pressSuppressed = false;   // drag/hold consumed this press
+static bool     pressMoved = false;      // drifted >30 px: not a tap/hold
+static bool     pressConsumed = false;   // action already fired this press
 static uint32_t pressStartMs = 0, pressPollMs = 0;
 static int      pressX = 0, pressY = 0;
 
@@ -800,19 +801,31 @@ static void handleTouch() {
     uint8_t ev = touch.data.event;     // 0 down, 1 up, 2 contact
     int x = touch.data.x, y = touch.data.y;
 
-    // Chip swipes are dependable (unlike its long press): menu shortcut
+    // Chip swipes are dependable (unlike its long press): menu shortcut.
+    // The chip repeats the gesture id in every report while the finger
+    // stays down, so fire at most once per press or the menu toggles
+    // over and over (visible as flashing).
     if (g == SWIPE_UP || g == SWIPE_DOWN || g == LONG_PRESS) {
-      pressActive = false;
-      if (!wakeOnly && now - lastTapMs >= 350) {
+      bool fire = !wakeOnly && !(pressActive && pressConsumed) &&
+                  now - lastTapMs >= 350;
+      if (fire) {
         lastTapMs = now + 200;
         toggleMenu();
       }
+      if (ev == 1) {                   // gesture ended with this report
+        pressActive = false;
+      } else {                         // finger still down: swallow repeats
+        if (!pressActive) pressStartMs = now;
+        pressActive = true;
+      }
+      pressConsumed = true;
+      pressMoved = true;               // never also a tap/hold
       return;
     }
 
     if (ev == 1) {                     // release
-      if (pressActive && !pressSuppressed && now - pressStartMs < HOLD_MS &&
-          now - lastTapMs >= 350) {
+      if (pressActive && !pressMoved && !pressConsumed &&
+          now - pressStartMs < HOLD_MS && now - lastTapMs >= 350) {
         lastTapMs = now;
         dispatchTap(pressX, pressY);
       } else if (!pressActive && !wakeOnly && now - lastTapMs >= 350) {
@@ -820,19 +833,21 @@ static void handleTouch() {
         dispatchTap(x, y);
       }
       pressActive = false;
-      pressSuppressed = false;
+      pressMoved = false;
+      pressConsumed = false;
       return;
     }
 
     // press start / finger still down
     if (!pressActive) {
       pressActive = true;
-      pressSuppressed = wakeOnly;      // wake press: never tap, never hold
+      pressMoved = false;
+      pressConsumed = wakeOnly;        // wake press: never tap, never hold
       pressStartMs = now;
       pressX = x;
       pressY = y;
     } else if (abs(x - pressX) > 30 || abs(y - pressY) > 30) {
-      pressSuppressed = true;          // moved: a drag, not a tap or hold
+      pressMoved = true;               // a drag, not a tap or hold
     }
     return;
   }
@@ -842,15 +857,17 @@ static void handleTouch() {
   pressPollMs = now;
   int fingers = touchFingerCount();
   if (fingers == 0) {                  // released without an "up" event
-    if (!pressSuppressed && now - pressStartMs < HOLD_MS &&
+    if (!pressMoved && !pressConsumed && now - pressStartMs < HOLD_MS &&
         now - lastTapMs >= 350) {
       lastTapMs = now;
       dispatchTap(pressX, pressY);
     }
     pressActive = false;
-    pressSuppressed = false;
-  } else if (fingers > 0 && !pressSuppressed && now - pressStartMs >= HOLD_MS) {
-    pressSuppressed = true;            // consume the rest of this press
+    pressMoved = false;
+    pressConsumed = false;
+  } else if (fingers > 0 && !pressMoved && !pressConsumed &&
+             now - pressStartMs >= HOLD_MS) {
+    pressConsumed = true;              // one action per press
     lastTapMs = now + 200;
     toggleMenu();
   }
