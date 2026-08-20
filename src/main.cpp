@@ -397,10 +397,13 @@ static void setBacklight(uint8_t v) {
   }
 }
 
+static bool blIsDim = false;   // touches on a dim screen only wake it
+
 static void backlightService() {
   uint32_t now = millis();
   bool bright = (now - lastInteractMs < BL_DIM_AFTER_MS) || now < toastUntil;
   setBacklight(bright ? BL_ACTIVE : BL_DIM);
+  blIsDim = !bright;
 }
 
 /* Rebuild the JSON served by the BLE INFO characteristic. */
@@ -551,10 +554,10 @@ static void drawArrow() {
   clampedLine(rX, rY, tipX, tipY, WHITE, DOT_PIXEL_1X1);
 }
 
+/* Walk timer as hours:minutes, e.g. "0:07", "1:23". */
 static void formatTime(uint32_t ms, char *out) {
-  uint32_t s = ms / 1000;
-  if (s >= 3600) sprintf(out, "%lu:%02lu:%02lu", s / 3600, (s / 60) % 60, s % 60);
-  else           sprintf(out, "%02lu:%02lu", s / 60, s % 60);
+  uint32_t m = ms / 60000;
+  sprintf(out, "%lu:%02lu", m / 60, m % 60);
 }
 
 static void formatDistance(float meters, char *out) {
@@ -609,7 +612,10 @@ static void drawReadouts() {
     sprintf(buf, "TGT %03d %s", (int)targetBearing, cardinalName(targetBearing));
     drawStringCentered(CX, 152, buf, &Font12, COL_TARGET, COL_BG);
   } else {
-    drawStringCentered(CX, 152, "TAP DIAL TO SET", &Font12, COL_DIM, COL_BG);
+    // alternate the idle hint so the menu gesture is discoverable
+    drawStringCentered(CX, 152,
+                       ((millis() / 3000) & 1) ? "HOLD FOR ROUTES" : "TAP DIAL TO SET",
+                       &Font12, COL_DIM, COL_BG);
   }
 
   // Info row: elapsed time | estimated distance (steps until GPS)
@@ -713,24 +719,35 @@ static void drawFrame() {
 /* ------------------------------------------------------------------ */
 /*  Touch                                                              */
 /* ------------------------------------------------------------------ */
-static void handleTouch() {
-  if (!touch.available()) return;
-  uint32_t now = millis();
-  lastInteractMs = now;                // wake backlight / boost frame rate
-  if (now - lastTapMs < 350) return;   // debounce
-  int x = touch.data.x;
-  int y = touch.data.y;
+/* The CST816S's own LONG_PRESS gesture needs a ~2 s perfectly-still hold
+ * and frequently never fires, so tap-vs-hold is decided here instead:
+ * a press that lasts HOLD_MS without moving opens the menu, anything
+ * shorter is a tap dispatched on release. Release is detected from the
+ * chip's finger-count register, so a missed "up" event can't wedge the
+ * state machine. Chip swipe gestures (which are reliable) also open it. */
+static const uint32_t HOLD_MS = 500;
+static bool     pressActive = false;
+static bool     pressSuppressed = false;   // drag/hold consumed this press
+static uint32_t pressStartMs = 0, pressPollMs = 0;
+static int      pressX = 0, pressY = 0;
 
-  // Long press anywhere toggles the route menu
-  if (touch.data.gestureID == LONG_PRESS) {
-    lastTapMs = now + 400;             // swallow the release events
-    if (uiScreen == SCR_MAIN) openMenu();
-    else uiScreen = SCR_MAIN;
-    return;
-  }
+static int touchFingerCount() {
+  Wire.beginTransmission(CST816S_ADDRESS);
+  Wire.write(0x02);
+  if (Wire.endTransmission(true)) return -1;
+  if (Wire.requestFrom(CST816S_ADDRESS, 1) != 1) return -1;
+  return Wire.read();
+}
+
+static void toggleMenu() {
+  if (uiScreen == SCR_MAIN) openMenu();
+  else uiScreen = SCR_MAIN;
+}
+
+static void dispatchTap(int x, int y) {
+  uint32_t now = millis();
 
   if (uiScreen == SCR_MENU) {
-    lastTapMs = now;
     menuTap(x, y);
     menuDirty = true;
     return;
@@ -768,6 +785,74 @@ static void handleTouch() {
     targetSet = true;
     lockFlashUntil = now + 1200;
     Serial.printf("Target locked: %d deg\n", (int)targetBearing);
+  }
+}
+
+static void handleTouch() {
+  uint32_t now = millis();
+
+  if (touch.available()) {
+    // A touch on a dimmed screen only wakes it — swallow the whole press
+    // so waking never locks a target or hits START by accident.
+    bool wakeOnly = blIsDim && !pressActive;
+    lastInteractMs = now;              // wake backlight / boost frame rate
+    uint8_t g = touch.data.gestureID;
+    uint8_t ev = touch.data.event;     // 0 down, 1 up, 2 contact
+    int x = touch.data.x, y = touch.data.y;
+
+    // Chip swipes are dependable (unlike its long press): menu shortcut
+    if (g == SWIPE_UP || g == SWIPE_DOWN || g == LONG_PRESS) {
+      pressActive = false;
+      if (!wakeOnly && now - lastTapMs >= 350) {
+        lastTapMs = now + 200;
+        toggleMenu();
+      }
+      return;
+    }
+
+    if (ev == 1) {                     // release
+      if (pressActive && !pressSuppressed && now - pressStartMs < HOLD_MS &&
+          now - lastTapMs >= 350) {
+        lastTapMs = now;
+        dispatchTap(pressX, pressY);
+      } else if (!pressActive && !wakeOnly && now - lastTapMs >= 350) {
+        lastTapMs = now;               // chip condensed the press to one event
+        dispatchTap(x, y);
+      }
+      pressActive = false;
+      pressSuppressed = false;
+      return;
+    }
+
+    // press start / finger still down
+    if (!pressActive) {
+      pressActive = true;
+      pressSuppressed = wakeOnly;      // wake press: never tap, never hold
+      pressStartMs = now;
+      pressX = x;
+      pressY = y;
+    } else if (abs(x - pressX) > 30 || abs(y - pressY) > 30) {
+      pressSuppressed = true;          // moved: a drag, not a tap or hold
+    }
+    return;
+  }
+
+  // No new event: watch a live press for hold-expiry or a missed release
+  if (!pressActive || now - pressPollMs < 60) return;
+  pressPollMs = now;
+  int fingers = touchFingerCount();
+  if (fingers == 0) {                  // released without an "up" event
+    if (!pressSuppressed && now - pressStartMs < HOLD_MS &&
+        now - lastTapMs >= 350) {
+      lastTapMs = now;
+      dispatchTap(pressX, pressY);
+    }
+    pressActive = false;
+    pressSuppressed = false;
+  } else if (fingers > 0 && !pressSuppressed && now - pressStartMs >= HOLD_MS) {
+    pressSuppressed = true;            // consume the rest of this press
+    lastTapMs = now + 200;
+    toggleMenu();
   }
 }
 

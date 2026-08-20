@@ -65,7 +65,7 @@
     <div class="hint">Click the map to add waypoints — the route snaps to
       walking paths between them.</div>
     <div class="row">
-      <button id="undoBtn">Undo point</button>
+      <button id="undoBtn" title="Ctrl/Cmd+Z">Undo</button>
       <button id="clearBtn">Clear</button>
       <label><input type="checkbox" id="loopBack"> return to start</label>
     </div>
@@ -84,7 +84,7 @@
 
   <h2>Device</h2>
   <div class="row">
-    <button id="btBtn" class="primary">Connect watch</button>
+    <button id="btBtn" class="primary">Connect device</button>
     <span id="btState" class="hint">not connected</span>
   </div>
   <div class="row">
@@ -261,18 +261,25 @@ function setRoute(latlngs) {
   updateSlotButtons();
 }
 
+let planEpoch = 0;   // bumped on undo/clear to void in-flight routing replies
+
 async function rebuildDrawRoute() {
   if (waypoints.length < 2) { setRoute([]); return; }
+  const ep = planEpoch;
   const wps = waypoints.slice();
   if ($('loopBack').checked && waypoints.length >= 2) wps.push(waypoints[0]);
-  try { setRoute((await osrmRoute(wps)).latlngs); }
-  catch (e) { log('routing failed: ' + e.message); }
+  try {
+    const rt = await osrmRoute(wps);
+    if (ep === planEpoch) setRoute(rt.latlngs);
+  } catch (e) { log('routing failed: ' + e.message); }
 }
 
 /* Round trip: waypoints on a circle through the start, sized so the
  * routed length lands near the target; one corrective iteration. */
 async function generateLoop() {
   if (!loopStart) { log('click the map to set a start point first'); return; }
+  const ep = planEpoch;
+  pushUndo();
   const targetM = parseFloat($('loopKm').value) * 1000;
   let r = targetM / (2 * Math.PI) * 1.1;
   let best = null;
@@ -290,13 +297,50 @@ async function generateLoop() {
       if (ratio > 0.85 && ratio < 1.15) break;
       r *= Math.max(0.4, Math.min(2.5, ratio));
     }
+    if (ep !== planEpoch) return;   // undone/cleared while routing
     setRoute(best.latlngs);
     log(`loop: ${(pathLen(best.latlngs) / 1000).toFixed(2)} km (target ${(targetM / 1000).toFixed(1)})`);
   } catch (e) { log('loop generation failed: ' + e.message); }
 }
 
-/* ------------------------------ modes ------------------------------ */
+/* ------------------------- modes and undo ------------------------- */
+/* Snapshot-based undo: every mutating action pushes the prior planning
+ * state; Ctrl/Cmd+Z (or the Undo button) restores it. */
+const undoStack = [];
+function pushUndo() {
+  undoStack.push({ mode, waypoints: waypoints.slice(), loopStart,
+                   route: routeLatLngs.slice() });
+  if (undoStack.length > 50) undoStack.shift();
+}
+
+function restoreMarkers() {
+  markers.forEach(mk => mk.remove());
+  markers = mode === 'draw'
+    ? waypoints.map(p => L.marker(p).addTo(map))
+    : loopStart ? [L.marker(loopStart).addTo(map)] : [];
+}
+
+function undo() {
+  const s = undoStack.pop();
+  if (!s) return;
+  planEpoch++;
+  mode = s.mode;
+  setModeUi();
+  waypoints = s.waypoints;
+  loopStart = s.loopStart;
+  restoreMarkers();
+  setRoute(s.route);
+}
+document.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'z' &&
+      !/INPUT|TEXTAREA/.test(document.activeElement.tagName)) {
+    e.preventDefault();
+    undo();
+  }
+});
+
 function clearPlanning() {
+  planEpoch++;
   waypoints = [];
   loopStart = null;
   markers.forEach(mk => mk.remove());
@@ -304,18 +348,25 @@ function clearPlanning() {
   setRoute([]);
 }
 
+function setModeUi() {
+  $('modeDraw').classList.toggle('on', mode === 'draw');
+  $('modeLoop').classList.toggle('on', mode === 'loop');
+  $('drawUi').style.display = mode === 'draw' ? '' : 'none';
+  $('loopUi').style.display = mode === 'loop' ? '' : 'none';
+}
 function setMode(m) {
-  if (m !== mode) clearPlanning();   // don't leave stale points on the map
+  if (m !== mode) {                  // don't leave stale points on the map
+    pushUndo();
+    clearPlanning();
+  }
   mode = m;
-  $('modeDraw').classList.toggle('on', m === 'draw');
-  $('modeLoop').classList.toggle('on', m === 'loop');
-  $('drawUi').style.display = m === 'draw' ? '' : 'none';
-  $('loopUi').style.display = m === 'loop' ? '' : 'none';
+  setModeUi();
 }
 $('modeDraw').onclick = () => setMode('draw');
 $('modeLoop').onclick = () => setMode('loop');
 
 map.on('click', e => {
+  pushUndo();
   if (mode === 'draw') {
     waypoints.push(e.latlng);
     markers.push(L.marker(e.latlng).addTo(map));
@@ -326,13 +377,9 @@ map.on('click', e => {
     markers.push(L.marker(e.latlng).addTo(map));
   }
 });
-$('undoBtn').onclick = () => {
-  waypoints.pop();
-  const m = markers.pop(); if (m) m.remove();
-  rebuildDrawRoute();
-};
-$('clearBtn').onclick = clearPlanning;
-$('loopBack').onchange = rebuildDrawRoute;
+$('undoBtn').onclick = undo;
+$('clearBtn').onclick = () => { pushUndo(); clearPlanning(); };
+$('loopBack').onchange = () => { pushUndo(); rebuildDrawRoute(); };
 $('genBtn').onclick = generateLoop;
 $('reGenBtn').onclick = () => { loopBearing = Math.random() * 360; generateLoop(); };
 
@@ -344,6 +391,7 @@ $('gpxFile').onchange = async e => {
   const pts = nodes.map(n =>
     L.latLng(parseFloat(n.getAttribute('lat')), parseFloat(n.getAttribute('lon'))));
   if (pts.length < 2) { log('no track points in GPX'); return; }
+  pushUndo();
   clearPlanning();
   setRoute(pts);
   map.fitBounds(L.latLngBounds(pts));
@@ -412,7 +460,7 @@ async function refreshSlots() {
 function renderSlots(list) {
   const el = $('slots');
   el.innerHTML = '';
-  if (!ctrlChr) { el.innerHTML = '<div class="hint">connect to see the watch’s route slots</div>'; return; }
+  if (!ctrlChr) { el.innerHTML = '<div class="hint">connect to see the device’s route slots</div>'; return; }
   for (let s = 0; s < 4; s++) {
     const m = list.find(x => x.slot === s) || { points: 0 };
     const row = document.createElement('div');

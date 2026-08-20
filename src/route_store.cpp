@@ -71,6 +71,7 @@ bool routeLoadMeta(uint8_t slot, RouteMeta &meta) {
   if (slot >= ROUTE_SLOTS) return false;
   char path[20];
   slotPath(slot, path);
+  if (!LittleFS.exists(path)) return false;  // empty slot: avoid VFS error spam
   File f = LittleFS.open(path, "r");
   if (!f) return false;
   bool ok = readHeader(f, meta);
@@ -83,6 +84,7 @@ bool routeLoadPoints(uint8_t slot, RoutePoint *buf, uint16_t maxCount, RouteMeta
   if (slot >= ROUTE_SLOTS) return false;
   char path[20];
   slotPath(slot, path);
+  if (!LittleFS.exists(path)) return false;
   File f = LittleFS.open(path, "r");
   if (!f) return false;
   bool ok = readHeader(f, meta) && meta.count <= maxCount
@@ -97,5 +99,6 @@ bool routeDelete(uint8_t slot) {
   if (slot >= ROUTE_SLOTS) return false;
   char path[20];
   slotPath(slot, path);
+  if (!LittleFS.exists(path)) return true;   // already gone
   return LittleFS.remove(path);
 }
